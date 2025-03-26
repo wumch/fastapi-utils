@@ -1,116 +1,252 @@
-from __future__ import annotations
-
 import asyncio
-import logging
-import time
-from asyncio import AbstractEventLoop
-from typing import Any, NoReturn
+from typing import NoReturn
+from unittest.mock import AsyncMock, call, patch
 
 import pytest
-from _pytest.capture import CaptureFixture
-from _pytest.logging import LogCaptureFixture
 
-from fastapi_utils.tasks import repeat_every
-
-logging.basicConfig(level=logging.INFO)
+from fastapi_utils.tasks import NoArgsNoReturnAsyncFuncT, repeat_every
 
 
-def ignore_exception(_loop: AbstractEventLoop, _context: dict[str, Any]) -> None:
-    pass
+# Fixtures:
+@pytest.fixture(scope="module")
+def seconds() -> float:
+    return 0.01
 
 
-@pytest.fixture(autouse=True)
-def setup_event_loop(event_loop: AbstractEventLoop) -> None:
-    event_loop.set_exception_handler(ignore_exception)
+@pytest.fixture(scope="module")
+def max_repetitions() -> int:
+    return 3
 
 
-@pytest.mark.asyncio
-async def test_repeat_print(capsys: CaptureFixture[str]) -> None:
-    @repeat_every(seconds=0.01, max_repetitions=3)
-    async def repeatedly_print_hello() -> None:
-        print("hello")
-
-    await repeatedly_print_hello()
-    await asyncio.sleep(0.1)
-    out, err = capsys.readouterr()
-    assert out == "hello\n" * 3
-    assert err == ""
+@pytest.fixture(scope="module")
+def wait_first(seconds: float) -> float:
+    return seconds
 
 
-@pytest.mark.asyncio
-async def test_repeat_print_delay(capsys: CaptureFixture[str]) -> None:
-    @repeat_every(seconds=0.07, max_repetitions=3)
-    def repeatedly_print_hello() -> None:
-        print("hello")
+# Tests:
+class TestRepeatEveryBase:
+    def setup_method(self) -> None:
+        self.counter = 0
+        self.completed = asyncio.Event()
 
-    await repeatedly_print_hello()
-    await asyncio.sleep(0.1)
-    out, err = capsys.readouterr()
-    assert out == "hello\n" * 2
-    assert err == ""
+    def increase_counter(self) -> None:
+        self.counter += 1
+
+    async def increase_counter_async(self) -> None:
+        self.increase_counter()
+
+    def loop_completed(self) -> None:
+        self.completed.set()
+
+    async def loop_completed_async(self) -> None:
+        self.loop_completed()
+
+    def kill_loop(self, exc: Exception) -> None:
+        self.completed.set()
+        raise exc
+
+    async def kill_loop_async(self, exc: Exception) -> None:
+        self.kill_loop(exc)
+
+    def continue_loop(self, exc: Exception) -> None:
+        return
+
+    async def continue_loop_async(self, exc: Exception) -> None:
+        self.continue_loop(exc)
+
+    def raise_exc(self) -> NoReturn:
+        self.increase_counter()
+        raise ValueError("error")
+
+    async def raise_exc_async(self) -> NoReturn:
+        self.raise_exc()
+
+    @pytest.fixture
+    def increase_counter_task(self, is_async: bool, seconds: float, max_repetitions: int) -> NoArgsNoReturnAsyncFuncT:
+        decorator = repeat_every(seconds=seconds, max_repetitions=max_repetitions, on_complete=self.loop_completed)
+        if is_async:
+            return decorator(self.increase_counter_async)
+        else:
+            return decorator(self.increase_counter)
+
+    @pytest.fixture
+    def wait_first_increase_counter_task(
+        self, is_async: bool, seconds: float, max_repetitions: int, wait_first: float
+    ) -> NoArgsNoReturnAsyncFuncT:
+        decorator = repeat_every(
+            seconds=seconds, max_repetitions=max_repetitions, wait_first=wait_first, on_complete=self.loop_completed
+        )
+        if is_async:
+            return decorator(self.increase_counter_async)
+        else:
+            return decorator(self.increase_counter)
+
+    @pytest.fixture
+    def stop_on_exception_task(self, is_async: bool, seconds: float, max_repetitions: int) -> NoArgsNoReturnAsyncFuncT:
+        if is_async:
+            decorator = repeat_every(
+                seconds=seconds,
+                max_repetitions=max_repetitions,
+                on_complete=self.loop_completed_async,
+                on_exception=self.kill_loop_async,
+            )
+            return decorator(self.raise_exc_async)
+        else:
+            decorator = repeat_every(
+                seconds=seconds,
+                max_repetitions=max_repetitions,
+                on_complete=self.loop_completed,
+                on_exception=self.kill_loop,
+            )
+            return decorator(self.raise_exc)
+
+    @pytest.fixture
+    def suppressed_exception_task(
+        self, is_async: bool, seconds: float, max_repetitions: int
+    ) -> NoArgsNoReturnAsyncFuncT:
+        if is_async:
+            decorator = repeat_every(
+                seconds=seconds,
+                max_repetitions=max_repetitions,
+                on_complete=self.loop_completed_async,
+                on_exception=self.continue_loop_async,
+            )
+            return decorator(self.raise_exc_async)
+        else:
+            decorator = repeat_every(
+                seconds=seconds,
+                max_repetitions=max_repetitions,
+                on_complete=self.loop_completed,
+                on_exception=self.continue_loop,
+            )
+            return decorator(self.raise_exc)
 
 
-@pytest.mark.asyncio
-async def test_repeat_print_wait(capsys: CaptureFixture[str]) -> None:
-    @repeat_every(seconds=0.07, max_repetitions=3, wait_first=True)
-    def repeatedly_print_hello() -> None:
-        print("hello")
+class TestRepeatEveryWithSynchronousFunction(TestRepeatEveryBase):
+    @pytest.fixture
+    def is_async(self) -> bool:
+        return False
 
-    await repeatedly_print_hello()
-    await asyncio.sleep(0.1)
-    out, err = capsys.readouterr()
-    assert out == "hello\n" * 1
-    assert err == ""
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_max_repetitions(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        increase_counter_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await increase_counter_task()
+        await self.completed.wait()
+
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls(max_repetitions * [call(seconds)], any_order=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_max_repetitions_and_wait_first(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        wait_first_increase_counter_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await wait_first_increase_counter_task()
+        await self.completed.wait()
+
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls((max_repetitions + 1) * [call(seconds)], any_order=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    async def test_stop_loop_on_exc(
+        self,
+        stop_on_exception_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await stop_on_exception_task()
+        await self.completed.wait()
+
+        assert self.counter == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_continue_loop_on_exc(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        suppressed_exception_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await suppressed_exception_task()
+        await self.completed.wait()
+
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls(max_repetitions * [call(seconds)], any_order=True)
 
 
-@pytest.mark.asyncio
-async def test_repeat_unlogged_error(caplog: LogCaptureFixture) -> None:
-    @repeat_every(seconds=0.07, max_repetitions=None)
-    def log_exc() -> NoReturn:
-        raise ValueError("repeat")
+class TestRepeatEveryWithAsynchronousFunction(TestRepeatEveryBase):
+    @pytest.fixture
+    def is_async(self) -> bool:
+        return True
 
-    await log_exc()
-    await asyncio.sleep(0.1)
-    record_tuples = [x for x in caplog.record_tuples if x[0] == __name__]
-    print(caplog.record_tuples)
-    assert len(record_tuples) == 0
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_max_repetitions(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        increase_counter_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await increase_counter_task()
+        await self.completed.wait()
 
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls(max_repetitions * [call(seconds)], any_order=True)
 
-@pytest.mark.asyncio
-async def test_repeat_log_error(caplog: LogCaptureFixture) -> None:
-    logger = logging.getLogger(__name__)
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_max_repetitions_and_wait_first(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        wait_first_increase_counter_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await wait_first_increase_counter_task()
+        await self.completed.wait()
 
-    @repeat_every(seconds=0.1, max_repetitions=None, logger=logger)
-    def log_exc() -> NoReturn:
-        raise ValueError("repeat")
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls((max_repetitions + 1) * [call(seconds)], any_order=True)
 
-    await log_exc()
-    n_record_tuples = 0
-    record_tuples: list[tuple[Any, ...]] = []
-    start_time = time.time()
-    while n_record_tuples < 2:  # ensure multiple records are logged
-        time_elapsed = time.time() - start_time
-        if time_elapsed > 1:
-            print(record_tuples)
-            assert False, "Test timed out"
-        await asyncio.sleep(0.05)
-        record_tuples = [x for x in caplog.record_tuples if x[0] == __name__]
-        n_record_tuples = len(record_tuples)
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    async def test_stop_loop_on_exc(
+        self,
+        stop_on_exception_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await stop_on_exception_task()
+        await self.completed.wait()
 
+        assert self.counter == 1
 
-@pytest.mark.asyncio
-async def test_repeat_raise_error(caplog: LogCaptureFixture, capsys: CaptureFixture[str]) -> None:
-    logger = logging.getLogger(__name__)
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(1)
+    @patch("asyncio.sleep")
+    async def test_continue_loop_on_exc(
+        self,
+        asyncio_sleep_mock: AsyncMock,
+        seconds: float,
+        max_repetitions: int,
+        suppressed_exception_task: NoArgsNoReturnAsyncFuncT,
+    ) -> None:
+        await suppressed_exception_task()
+        await self.completed.wait()
 
-    @repeat_every(seconds=0.07, max_repetitions=None, raise_exceptions=True, logger=logger)
-    def raise_exc() -> NoReturn:
-        raise ValueError("repeat")
-
-    await raise_exc()
-    await asyncio.sleep(0.1)
-    out, err = capsys.readouterr()
-    assert out == ""
-    assert err == ""
-    record_tuples = [x for x in caplog.record_tuples if x[0] == __name__]
-    print(caplog.record_tuples)
-    assert len(record_tuples) == 1
+        assert self.counter == max_repetitions
+        asyncio_sleep_mock.assert_has_calls(max_repetitions * [call(seconds)], any_order=True)

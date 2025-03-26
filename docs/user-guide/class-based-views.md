@@ -48,9 +48,6 @@ The highlighted lines above show the results of performing each of the numbered 
 Note how the signature of each endpoint definition now includes only the parts specific
 to that endpoint. 
 
-(Also note that we've also used the [`InferringRouter`](inferring-router.md){.internal-link target=_blank}
-here to remove the need to specify a `response_model` in the endpoint decorators.)
-
 Hopefully this helps you to better reuse dependencies across endpoints!
 
 !!! info
@@ -63,4 +60,3 @@ Hopefully this helps you to better reuse dependencies across endpoints!
     You should **not** make use of any arguments to `__init__` with the same name as any annotated instance attributes
     on the class. Those values will be set as attributes on the class instance prior to calling the `__init__` function
     you define, so you can still safely access them inside your custom `__init__` function if desired.
-     
